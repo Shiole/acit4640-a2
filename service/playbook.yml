@@ -1,0 +1,213 @@
+---
+- name: A02 All Play
+  hosts: all
+  become: yes
+  tasks:
+    - name: OS Package Setup
+      ansible.builtin.package:
+        update_cache: true
+        name: "{{ item }}"
+        state: latest
+      with_items: 
+          - bind9-dnsutils 
+          - tcpdump
+          - nmap 
+          - mysql-client
+
+- name: A02 DB Play
+  hosts: db
+  become: yes
+  tasks:
+    - name: Install MySQL Server and pymysql
+      ansible.builtin.package:
+        update_cache: true
+        name: "{{ item }}"
+        state: latest
+      with_items:
+          - mysql-server
+          - python3-pymysql
+
+    - name: Update MySQL config
+      ansible.builtin.lineinfile:
+        path: /etc/mysql/mysql.conf.d/mysqld.cnf
+        regexp: '^bind-address='
+        line: 'bind-address=0.0.0.0'
+    
+    - name: Start and enable MySQL service
+      ansible.builtin.service:
+        name: mysql
+        state: restarted
+        enabled: true 
+
+    - name: Change MySQL root user password
+      community.mysql.mysql_user:
+        name: root
+        password: P@ssw0rd
+        login_user: root
+        login_password: P@ssw0rd
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Remove anonymous MySQL users 
+      community.mysql.mysql_user:
+        name: ''
+        host_all: true
+        state: absent 
+        login_user: root
+        login_password: P@ssw0rd
+        check_implicit_admin: true
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Remove the test database if exist
+      community.mysql.mysql_db:
+        name: test
+        state: absent
+        login_user: root
+        login_password: P@ssw0rd
+        check_implicit_admin: true
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+    
+    - name: Remove backend database if exist
+      community.mysql.mysql_db:
+          name: backend
+          state: absent
+          login_user: root
+          login_password: P@ssw0rd
+          check_implicit_admin: true
+          login_unix_socket: /var/run/mysqld/mysqld.sock
+    
+    - name: Create Application DB 
+      community.mysql.mysql_db:
+        name: backend
+        state: present 
+        login_user: root
+        login_password: P@ssw0rd
+        check_implicit_admin: true
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Create Application user 
+      community.mysql.mysql_user:
+        name: a02 
+        password: password
+        host: '%'
+        priv: '*.*:ALL,GRANT'
+        state: present 
+        login_user: root
+        login_password: P@ssw0rd
+        check_implicit_admin: true
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Create Application DB table and insert data
+      community.mysql.mysql_query:
+        login_db: backend 
+        query: 
+          - CREATE TABLE IF NOT EXISTS item (name varchar(30) NOT NULL, bcit_id varchar(10) NOT NULL, PRIMARY KEY (bcit_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+          - INSERT INTO item (name, bcit_id) VALUES ('Kitty Low', 'A01273256');
+        login_user: a02
+        login_password: password
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+    
+    - name: Disallow root login remotely
+      community.mysql.mysql_query:
+        login_db: backend
+        query: 
+          - DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+        login_user: root
+        login_password: P@ssw0rd
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Restart MySQL service 
+      ansible.builtin.systemd:
+        name: mysql
+        state: restarted
+
+- name: A02 Backend Server Play 
+  hosts: backend
+  become: yes
+  tasks:
+    - name: Install packages 
+      ansible.builtin.package:
+        update_cache: true
+        name: "{{ item }}"
+        state: latest
+      with_items:
+          - git
+          - libmysqlclient-dev
+          - pkg-config
+          - python3-dev
+          - python3-pip
+    
+    - name: Create OS user a02
+      ansible.builtin.user: 
+        name: a02 
+        home: /a02
+        shell: /bin/bash 
+    
+    - name: Get application code 
+      ansible.builtin.copy:
+        src: ./templates/backend
+        dest: /a02/
+        owner: a02
+        force: true
+      tags: backend
+
+    - name: Install Python dependency packages 
+      pip:
+        requirements: /a02/backend/requirements.txt
+        extra_args: --break-system-packages
+
+    - name: Transfer application unit file 
+      ansible.builtin.copy:
+        src: ./templates/backend.service
+        dest: /etc/systemd/system/backend.service
+        owner: root
+        group: root
+        force: true
+      tags: backend
+
+    - name: Reload systemd
+      ansible.builtin.systemd: 
+        daemon_reload: true
+      tags: backend
+    
+    - name: Start and enable backend service 
+      ansible.builtin.service:
+        name: backend 
+        state: started 
+        enabled: true 
+      tags: backend
+
+- name: A02 Web Server Play
+  hosts: web
+  become: yes
+  tasks:
+    - name: Install Nginx  
+      ansible.builtin.package:
+        update_cache: true
+        name: nginx
+        state: latest 
+
+    - name: Configure nginx
+      ansible.builtin.copy:
+        src: ./templates/default
+        dest: /etc/nginx/sites-available/
+        force: true
+
+    - name: Create OS user a02
+      ansible.builtin.user: 
+        name: a02 
+        home: /a02
+        shell: /bin/bash
+    
+    - name: Copy over frontend code 
+      ansible.builtin.copy:
+        src: ./templates/index.html
+        dest: /usr/share/nginx/html/index.html
+        mode: '777'
+        force: true
+
+    - name: Restart and enable nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        enabled: true
+      become: true
